@@ -170,6 +170,8 @@ class OpenAIBaseAdapter(ProviderAdapter, abc.ABC):
         """
         Make a call to the OpenAI Responses API
         """
+        # Ensure verbosity is set to 'high' for detailed output
+        self._ensure_verbosity()
 
         resp = self.client.responses.create(
             model=self.model_config.model_name,
@@ -198,7 +200,10 @@ class OpenAIBaseAdapter(ProviderAdapter, abc.ABC):
         Make a streaming call to the OpenAI Responses API and return the final response.
         """
         logger.debug(f"Starting streaming responses for model: {self.model_config.model_name}")
-        
+
+        # Ensure verbosity is set to 'high' for detailed output
+        self._ensure_verbosity()
+
         # Prepare kwargs for streaming, removing 'stream' to avoid duplication
         stream_kwargs = {k: v for k, v in self.model_config.kwargs.items() if k != 'stream'}
         
@@ -369,7 +374,18 @@ class OpenAIBaseAdapter(ProviderAdapter, abc.ABC):
             if "max_tokens" in self.model_config.kwargs:
                 self.model_config.kwargs["max_output_tokens"] = self.model_config.kwargs.pop("max_tokens")
             if "max_completion_tokens" in self.model_config.kwargs:
-                self.model_config.kwargs["max_output_tokens"] = self.model_config.kwargs.pop("max_completion_tokens") 
+                self.model_config.kwargs["max_output_tokens"] = self.model_config.kwargs.pop("max_completion_tokens")
+
+    def _ensure_verbosity(self):
+        """
+        Ensure text.verbosity is set to 'high' for Responses API calls.
+        This ensures detailed output is returned, especially for reasoning models.
+        """
+        if self.model_config.api_type == APIType.RESPONSES:
+            if "text" not in self.model_config.kwargs:
+                self.model_config.kwargs["text"] = {}
+            if "verbosity" not in self.model_config.kwargs["text"]:
+                self.model_config.kwargs["text"]["verbosity"] = "high" 
 
     def _calculate_cost(self, response: Any) -> Cost:
         """Calculate usage costs, validate token counts, and return a Cost object."""
