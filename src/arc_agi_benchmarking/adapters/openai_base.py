@@ -28,14 +28,20 @@ class _ResponsesOutput:
         self.role = "assistant"
         self.type = "message"
 
+class _ResponsesReasoning:
+    def __init__(self, summary=None):
+        self.summary = summary
+
 class _ResponsesResponse:
-    def __init__(self, model_name, content, usage_data, response_id, finish_reason="stop"):
+    def __init__(self, model_name, content, usage_data, response_id, finish_reason="stop", reasoning=None):
         self.id = response_id or "stream-response"
         self.model = model_name
         self.object = "response"
         self.output = [_ResponsesOutput(content)]
+        self.output_text = content
         self.finish_reason = finish_reason
         self.usage = usage_data
+        self.reasoning = reasoning
 
 
 class OpenAIBaseAdapter(ProviderAdapter, abc.ABC):
@@ -218,39 +224,101 @@ class OpenAIBaseAdapter(ProviderAdapter, abc.ABC):
             
             # Process the stream and collect data
             content_chunks = []
+            reasoning_chunks = []
             response_id = None
             finish_reason = "stop"
             usage_data = None
-            
+
             for chunk in stream:
                 # Extract response ID
                 if chunk.type == 'response.created':
                     response_id = chunk.response.id
-                
-                # Extract content deltas
+
+                # Extract output text deltas
                 if chunk.type == 'response.output_text.delta':
                     content_chunks.append(chunk.delta)
-                
+
+                # Extract reasoning deltas
+                if chunk.type == 'response.reasoning.delta':
+                    reasoning_chunks.append(chunk.delta)
+
                 # Track finish reason
                 if hasattr(chunk, 'finish_reason') and chunk.finish_reason:
                     finish_reason = chunk.finish_reason
-                
-                # Extract usage data
+
+                # Extract usage data from response object
                 if hasattr(chunk, 'response') and chunk.response:
                     usage_data = self._get_usage(chunk.response)
-            
+
+            # Always retrieve final response to get complete output array with reasoning
+            reasoning_summary = None
+            if response_id:
+                try:
+                    final_response = self.client.responses.retrieve(response_id)
+
+                    # Parse the output array to extract reasoning content
+                    if hasattr(final_response, 'output') and final_response.output:
+                        logger.debug(f"Parsing output array with {len(final_response.output)} items")
+                        for idx, output_item in enumerate(final_response.output):
+                            item_type = getattr(output_item, 'type', 'UNKNOWN')
+                            logger.debug(f"Output item {idx}: type={item_type}")
+
+                            # Look for reasoning blocks (type: "reasoning")
+                            if hasattr(output_item, 'type') and output_item.type == 'reasoning':
+                                logger.debug(f"Found reasoning block at index {idx}")
+                                logger.debug(f"Reasoning item attributes: {dir(output_item)}")
+                                logger.debug(f"Reasoning item dict: {output_item.__dict__ if hasattr(output_item, '__dict__') else 'NO DICT'}")
+
+                                # Extract content from reasoning block
+                                if hasattr(output_item, 'content'):
+                                    content = output_item.content
+                                    logger.debug(f"Reasoning content type: {type(content)}")
+
+                                    # content can be a string or array of content objects
+                                    if isinstance(content, list):
+                                        reasoning_texts = [c.text if hasattr(c, 'text') else str(c) for c in content]
+                                        reasoning_summary = '\n'.join(reasoning_texts)
+                                    elif isinstance(content, str):
+                                        reasoning_summary = content
+                                    elif hasattr(content, 'text'):
+                                        reasoning_summary = content.text
+                                    else:
+                                        logger.warning(f"Unknown reasoning content structure: {content}")
+
+                                    logger.debug(f"Reasoning summary length: {len(reasoning_summary) if reasoning_summary else 0}")
+                                else:
+                                    logger.warning(f"Reasoning block has no content attribute")
+
+                    # Fallback: use streamed reasoning chunks if output array didn't have it
+                    if not reasoning_summary and reasoning_chunks:
+                        reasoning_summary = ''.join(reasoning_chunks)
+
+                    # Get usage if we didn't get it during streaming
+                    if usage_data is None:
+                        usage_data = self._get_usage(final_response)
+
+                except Exception as e:
+                    logger.warning(f"Failed to retrieve final response for reasoning: {e}")
+                    # Fallback to streamed reasoning chunks
+                    if reasoning_chunks:
+                        reasoning_summary = ''.join(reasoning_chunks)
+
             # Build final response
             final_content = ''.join(content_chunks)
             response_id = response_id or f"stream-{int(time.time())}"
-            
-            logger.debug(f"Streaming complete. Content length: {len(final_content)}")
-            
+
+            logger.debug(f"Streaming complete. Content length: {len(final_content)}, Reasoning captured: {reasoning_summary is not None}")
+
+            # Create reasoning object if we captured a summary
+            reasoning_obj = _ResponsesReasoning(summary=reasoning_summary) if reasoning_summary is not None else None
+
             return _ResponsesResponse(
                 model_name=self.model_config.model_name,
                 content=final_content,
                 usage_data=usage_data,
                 response_id=response_id,
-                finish_reason=finish_reason
+                finish_reason=finish_reason,
+                reasoning=reasoning_obj
             )
             
         except Exception as e:
@@ -328,17 +396,63 @@ class OpenAIBaseAdapter(ProviderAdapter, abc.ABC):
             )
         )
 
-    def _get_reasoning_summary(self, response: Any) -> Optional[List[Dict[str, Any]]]:
+    def _get_reasoning_summary(self, response: Any) -> Optional[str]:
         """
-        Extract reasoning summary from the response if available (primarily for Responses API).
+        Extract and normalize reasoning summary from the response if available (Responses API).
         """
-        reasoning_summary = None
-        if self.model_config.api_type == APIType.RESPONSES:
-            # Safely access potential reasoning summary
-            if hasattr(response, 'reasoning') and response.reasoning and hasattr(response.reasoning, 'summary'):
-                reasoning_summary = response.reasoning.summary # Will be None if not present
-        # Chat Completions API does not currently provide a separate summary field
-        return reasoning_summary
+        if self.model_config.api_type != APIType.RESPONSES:
+            return None
+
+        summary = None
+        try:
+            # Primary location: top-level reasoning object
+            reasoning_obj = getattr(response, 'reasoning', None)
+            if reasoning_obj and hasattr(reasoning_obj, 'summary'):
+                summary = reasoning_obj.summary
+
+            # Fallback: some providers nest reasoning on output items
+            if summary is None and hasattr(response, 'output') and response.output:
+                for output in response.output:
+                    nested_reasoning = getattr(output, 'reasoning', None)
+                    if nested_reasoning and hasattr(nested_reasoning, 'summary'):
+                        summary = nested_reasoning.summary
+                        break
+        except Exception as exc:
+            logger.debug(f"Unable to extract reasoning summary: {exc}", exc_info=True)
+
+        return self._coerce_reasoning_summary_to_text(summary)
+
+    def _coerce_reasoning_summary_to_text(self, summary: Any) -> Optional[str]:
+        """
+        Normalize reasoning summaries of various shapes (str/list/dict/obj) into a string.
+        """
+        if summary is None:
+            return None
+
+        if isinstance(summary, str):
+            clean = summary.strip()
+            return clean or None
+
+        if isinstance(summary, list):
+            parts: List[str] = []
+            for item in summary:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text") or item.get("message") or item.get("content")
+                    if text:
+                        parts.append(str(text))
+                elif hasattr(item, "text"):
+                    text = getattr(item, "text", None)
+                    if text:
+                        parts.append(str(text))
+            merged = "\n\n".join([p.strip() for p in parts if p and str(p).strip()])
+            return merged or None
+
+        try:
+            return str(summary)
+        except Exception:
+            return None
 
     def _get_content(self, response: Any) -> str:
         """
