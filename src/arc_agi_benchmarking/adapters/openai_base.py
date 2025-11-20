@@ -266,11 +266,14 @@ class OpenAIBaseAdapter(ProviderAdapter, abc.ABC):
                             # Look for reasoning blocks (type: "reasoning")
                             if hasattr(output_item, 'type') and output_item.type == 'reasoning':
                                 logger.debug(f"Found reasoning block at index {idx}")
-                                logger.debug(f"Reasoning item attributes: {dir(output_item)}")
-                                logger.debug(f"Reasoning item dict: {output_item.__dict__ if hasattr(output_item, '__dict__') else 'NO DICT'}")
 
-                                # Extract content from reasoning block
-                                if hasattr(output_item, 'content'):
+                                # Try different fields for reasoning content
+                                # 1. Try summary first (plain text summary)
+                                if hasattr(output_item, 'summary') and output_item.summary:
+                                    reasoning_summary = output_item.summary
+                                    logger.debug(f"Got reasoning from 'summary' field, length: {len(reasoning_summary)}")
+                                # 2. Try content (may be None or empty)
+                                elif hasattr(output_item, 'content') and output_item.content:
                                     content = output_item.content
                                     logger.debug(f"Reasoning content type: {type(content)}")
 
